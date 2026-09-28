@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { fetchLeaderboard } from '@/lib/leaderboard';
 import { type LeaderboardEntry } from '@alvinmunk/shared';
 import { loadProfile } from '@/lib/profile';
@@ -14,6 +14,9 @@ import { Sticker } from '@/components/ui/sticker';
 import { useTranslations } from '@/lib/i18n';
 import { cn, shortAddress } from '@/lib/utils';
 
+/** Max concurrent reverseHandle calls so we don't flood the RPC. */
+const HANDLE_CONCURRENCY = 5;
+
 export default function LeaderboardPage() {
   const t = useTranslations();
   const [rows, setRows] = useState<LeaderboardEntry[]>([]);
@@ -22,22 +25,78 @@ export default function LeaderboardPage() {
   const [stale, setStale] = useState(false);
   const me = loadProfile()?.address;
 
+  /**
+   * Track addresses whose lookup is already in-flight (or done) so we never
+   * start the same lookup twice, even if the poll fires a new `rows` array
+   * while a batch is still running.
+   */
+  const pendingHandles = useRef<Set<string>>(new Set());
+
+  // Depend on a stable string key (sorted addresses) rather than the array
+  // reference so a poll that returns identical data doesn't restart lookups.
+  const addressKey = rows.map((r) => r.address).sort().join('\n');
+
   useEffect(() => {
-    const missing = rows.map((r) => r.address).filter((a) => !(a in handles));
+    // Only enqueue addresses we haven't started looking up yet.
+    const missing = rows
+      .map((r) => r.address)
+      .filter((a) => !(a in handles) && !pendingHandles.current.has(a));
+
     if (missing.length === 0) return;
-    let alive = true;
-    Promise.all(missing.map(async (a) => [a, await reverseHandle(a).catch(() => null)] as const)).then(
-      (pairs) => alive && setHandles((h) => ({ ...h, ...Object.fromEntries(pairs) })),
-    );
-    return () => { alive = false; };
-  }, [rows, handles]);
+
+    // Mark them all as in-flight immediately so concurrent effect runs skip them.
+    for (const a of missing) pendingHandles.current.add(a);
+
+    let cancelled = false;
+
+    // Resolve in batches of HANDLE_CONCURRENCY, merging each result as it arrives.
+    const resolve = async () => {
+      for (let i = 0; i < missing.length; i += HANDLE_CONCURRENCY) {
+        if (cancelled) break;
+        const batch = missing.slice(i, i + HANDLE_CONCURRENCY);
+        const pairs = await Promise.all(
+          batch.map(async (a) => [a, await reverseHandle(a).catch(() => null)] as const),
+        );
+        if (!cancelled) {
+          setHandles((h) => ({ ...h, ...Object.fromEntries(pairs) }));
+        }
+      }
+    };
+
+    void resolve();
+
+    // We do NOT remove addresses from pendingHandles on cancel — if the
+    // component unmounts the lookup is abandoned, but on the next mount a
+    // fresh ref is created and lookups start from scratch, which is correct.
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [addressKey]); // stable key: only re-runs when the actual set of addresses changes
 
   useEffect(() => {
     let alive = true;
     const tick = async () => {
       try {
         const r = await fetchLeaderboard();
-        if (alive) { setRows(r); setStale(false); }
+        if (!alive) return;
+        // Only update rows when the ranking actually changed so we don't
+        // produce a new array reference (and thus don't re-trigger the
+        // handle-lookup effect) on a quiet poll.
+        setRows((prev) => {
+          if (
+            prev.length === r.length &&
+            prev.every(
+              (e, i) =>
+                e.address === r[i].address &&
+                e.score === r[i].score &&
+                e.rank === r[i].rank &&
+                e.flagged === r[i].flagged,
+            )
+          ) {
+            return prev; // same content — keep the existing reference
+          }
+          return r;
+        });
+        setStale(false);
       } catch {
         if (alive) setStale(true);
       } finally {
