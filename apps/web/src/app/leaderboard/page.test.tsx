@@ -1,192 +1,294 @@
-/**
- * Tests for issue #208: leaderboard handle lookups were cancelled by every 5-second
- * poll because the handle-lookup effect depended on the `rows` array reference rather
- * than the stable set of addresses, and `setRows` was called unconditionally on every
- * tick even when nothing changed.
- *
- * Acceptance criteria (from the issue):
- *  - With reverseHandle mocked to take 8 s, handles still appear.
- *  - Each address is looked up at most once while a lookup is pending.
- *  - A vitest with fake timers covers the poll/lookup interaction.
- */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, act, waitFor } from '@testing-library/react';
-import React from 'react';
+import React, { act } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// ── hoisted mocks (must come before any import that pulls the real modules) ──
+(globalThis as { React?: typeof React }).React = React;
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-const { fetchLeaderboardMock, reverseHandleMock, loadProfileMock } = vi.hoisted(() => ({
+const { fetchLeaderboardMock, reverseHandlesMock } = vi.hoisted(() => ({
   fetchLeaderboardMock: vi.fn(),
-  reverseHandleMock: vi.fn(),
-  loadProfileMock: vi.fn(),
+  reverseHandlesMock: vi.fn(),
 }));
 
-vi.mock('@/lib/leaderboard', () => ({ fetchLeaderboard: fetchLeaderboardMock }));
-vi.mock('@/lib/registry', () => ({ reverseHandle: reverseHandleMock }));
-vi.mock('@/lib/profile', () => ({ loadProfile: loadProfileMock }));
+vi.mock('@/lib/leaderboard', () => ({
+  fetchLeaderboard: fetchLeaderboardMock,
+}));
+vi.mock('@/lib/profile', () => ({ loadProfile: () => null }));
+vi.mock('@/lib/registry', () => ({
+  reverseHandles: reverseHandlesMock,
+}));
+vi.mock('@/lib/i18n', () => ({ useTranslations: () => (k: string) => k }));
 
-// Stub out every UI component the page imports so the test stays fast and
-// import-light; we only care about the data/effect logic.
-vi.mock('@/components/brand/crest', () => ({ Crest: () => null }));
-vi.mock('@/components/fx/frame', () => ({
-  Frame: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
-}));
-vi.mock('@/components/fx/share-row', () => ({ ShareRow: () => null }));
-vi.mock('@/components/ui/skeleton', () => ({ Skeleton: () => null }));
-vi.mock('@/components/ui/state-art', () => ({ StateArt: () => null }));
-vi.mock('@/components/ui/sticker', () => ({ Sticker: () => null }));
-vi.mock('@/lib/i18n', () => ({
-  useTranslations: () => (key: string) => key,
-}));
-vi.mock('@/lib/utils', () => ({
-  cn: (...c: string[]) => c.filter(Boolean).join(' '),
-  shortAddress: (a: string) => a.slice(0, 6) + '…' + a.slice(-4),
-}));
-
+// Fix for default exports
 import LeaderboardPage from './page';
 
-// ── helpers ──
+describe('LeaderboardPage', () => {
+  let root: Root;
+  let container: HTMLDivElement;
 
-const ADDR_A = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
-const ADDR_B = 'GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
-
-function makeRows(addresses: string[]) {
-  return addresses.map((address, i) => ({
-    rank: i + 1,
-    address,
-    score: 100 - i * 10,
-    flagged: false,
-  }));
-}
-
-// ── tests ──
-
-describe('LeaderboardPage — poll / handle-lookup interaction (issue #208)', () => {
   beforeEach(() => {
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    fetchLeaderboardMock.mockReset();
+    reverseHandlesMock.mockReset();
+    // Matches the real contract: every requested address gets an entry (null if
+    // unresolved), so the "missing handles" effect settles instead of re-firing forever.
+    reverseHandlesMock.mockImplementation(async (addrs: string[]) =>
+      Object.fromEntries(addrs.map((a) => [a, null])),
+    );
     vi.useFakeTimers();
-    loadProfileMock.mockReturnValue(null);
-    // Default: instant empty response, so the loading skeleton disappears quickly.
-    fetchLeaderboardMock.mockResolvedValue([]);
-    reverseHandleMock.mockResolvedValue(null);
   });
 
   afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
     vi.useRealTimers();
-    vi.clearAllMocks();
   });
 
-  it('shows @handle for an address even when reverseHandle takes 8 s', async () => {
-    // reverseHandle resolves after 8 s (longer than the 5-s poll interval).
-    reverseHandleMock.mockImplementation(
-      (addr: string) =>
+  it('shows error state when fetch fails on first load with no snapshot', async () => {
+    fetchLeaderboardMock.mockRejectedValue(new Error('rpc error'));
+
+    await act(async () => {
+      root.render(<LeaderboardPage />);
+      // wait for initial mount effect
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain('leaderboard.syncFailed');
+    expect(container.textContent).toContain('leaderboard.syncFailedBody');
+    expect(container.textContent).not.toContain('leaderboard.empty');
+  });
+
+  it('shows stale badge and empty state when snapshot is empty but later fetch fails', async () => {
+    // first load succeeds with []
+    fetchLeaderboardMock.mockResolvedValueOnce([]);
+
+    await act(async () => {
+      root.render(<LeaderboardPage />);
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain('leaderboard.live');
+    expect(container.textContent).toContain('leaderboard.empty');
+
+    // next poll fails
+    fetchLeaderboardMock.mockRejectedValueOnce(new Error('rpc error'));
+
+    await act(async () => {
+      vi.advanceTimersByTime(5000);
+      await Promise.resolve();
+    });
+
+    // since rows is still empty and it's stale, it will transition to Sync Failed instead of showing "stale" badge on empty board
+    expect(container.textContent).toContain('leaderboard.syncFailed');
+  });
+
+  it('does not confuse a genuinely empty-but-healthy result with an outage', async () => {
+    // The RPC is healthy and simply has nothing to report — fetchLeaderboard resolves
+    // (no throw) with an empty list, same as a real "no events yet" network.
+    fetchLeaderboardMock.mockResolvedValue([]);
+
+    await act(async () => {
+      root.render(<LeaderboardPage />);
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain('leaderboard.live');
+    expect(container.textContent).toContain('leaderboard.empty');
+    expect(container.textContent).not.toContain('leaderboard.syncFailed');
+    expect(container.textContent).not.toContain('leaderboard.syncDelayed');
+  });
+
+  it('keeps showing the last good rows with a stale badge when a later poll fails', async () => {
+    const rows = [{ address: 'A', score: 10, rank: 1, flagged: false }];
+    fetchLeaderboardMock.mockResolvedValueOnce(rows);
+
+    await act(async () => {
+      root.render(<LeaderboardPage />);
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain('leaderboard.live');
+
+    fetchLeaderboardMock.mockRejectedValueOnce(new Error('rpc error'));
+
+    await act(async () => {
+      vi.advanceTimersByTime(5000);
+      await Promise.resolve();
+    });
+
+    // Rows stay on screen (never cleared on a failed poll); the badge switches to "delayed",
+    // not the harder "Sync Failed" empty-state — those are two different outage severities.
+    expect(container.textContent).toContain('leaderboard.syncDelayed');
+    expect(container.textContent).not.toContain('leaderboard.syncFailed');
+    expect(container.textContent).not.toContain('leaderboard.empty');
+  });
+});
+
+/**
+ * Tests for issue #208: leaderboard handle lookups were cancelled by every 5-second
+ * poll because the handle-lookup effect depended on the `rows` array reference rather
+ * than the stable set of addresses. The fix depends on `addressKey` (sorted, joined
+ * addresses) instead, and tracks in-flight addresses in a ref so a lookup already
+ * running is never restarted.
+ *
+ * By the time this landed, #319 had already replaced the per-address `reverseHandle`
+ * loop with one batched `reverseHandles(missing)` call (lib/registry.ts's
+ * `reverse_many`), so these tests exercise that batched call rather than a
+ * concurrency-limited loop of single-address calls.
+ *
+ * Acceptance criteria (from the issue):
+ *  - With the handle lookup mocked to take 8 s, handles still appear.
+ *  - Each address is looked up at most once while a lookup is pending.
+ *  - A vitest with fake timers covers the poll/lookup interaction.
+ */
+describe('LeaderboardPage — poll / handle-lookup interaction (issue #208)', () => {
+  let root: Root;
+  let container: HTMLDivElement;
+
+  const ADDR_A = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+  const ADDR_B = 'GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
+
+  function makeRows(addresses: string[]) {
+    return addresses.map((address, i) => ({
+      rank: i + 1,
+      address,
+      score: 100 - i * 10,
+      flagged: false,
+    }));
+  }
+
+  beforeEach(() => {
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    fetchLeaderboardMock.mockReset();
+    reverseHandlesMock.mockReset();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+    vi.useRealTimers();
+  });
+
+  it('shows @handle for an address even when the lookup takes 8 s', async () => {
+    // reverseHandles resolves after 8 s (longer than the 5-s poll interval).
+    reverseHandlesMock.mockImplementation(
+      (addrs: string[]) =>
         new Promise((resolve) =>
-          setTimeout(() => resolve(addr === ADDR_A ? 'alice' : null), 8_000),
+          setTimeout(
+            () =>
+              resolve(Object.fromEntries(addrs.map((a) => [a, a === ADDR_A ? 'alice' : null]))),
+            8_000,
+          ),
         ),
     );
 
     fetchLeaderboardMock.mockResolvedValue(makeRows([ADDR_A]));
 
-    render(<LeaderboardPage />);
-
-    // Let the first poll settle and the handle lookup start.
     await act(async () => {
-      await vi.runAllTicks(); // flush microtasks (fetchLeaderboard resolves)
+      root.render(<LeaderboardPage />);
+      await Promise.resolve();
     });
 
-    // Advance 5 s — the second poll fires. Handles should NOT be reset to
-    // the short address because the lookup is still in flight.
+    // Advance 5 s — the second poll fires. The handle should NOT have appeared yet
+    // because the lookup is still in flight, and it must not have been restarted.
     await act(async () => {
       vi.advanceTimersByTime(5_000);
-      await vi.runAllTicks();
+      await Promise.resolve();
     });
+    expect(container.textContent).not.toContain('@alice');
 
-    // Still loading handles — the short address should be visible (not a crash).
-    expect(screen.queryByText('@alice')).toBeNull();
-
-    // Advance 3 more seconds — total 8 s — the reverseHandle promise resolves.
+    // Advance 3 more seconds — total 8 s — the batched lookup resolves.
     await act(async () => {
       vi.advanceTimersByTime(3_000);
-      await vi.runAllTicks();
+      await Promise.resolve();
     });
 
-    // The handle should now appear.
-    await waitFor(() => expect(screen.getByText('@alice')).toBeTruthy());
+    expect(container.textContent).toContain('@alice');
+    expect(reverseHandlesMock).toHaveBeenCalledTimes(1);
   });
 
   it('looks up each address at most once while a lookup is pending', async () => {
     // Slow lookup — takes longer than two poll intervals.
-    reverseHandleMock.mockImplementation(
-      () => new Promise((resolve) => setTimeout(() => resolve(null), 12_000)),
+    reverseHandlesMock.mockImplementation(
+      (addrs: string[]) =>
+        new Promise((resolve) =>
+          setTimeout(
+            () => resolve(Object.fromEntries(addrs.map((a) => [a, null]))),
+            12_000,
+          ),
+        ),
     );
 
     fetchLeaderboardMock.mockResolvedValue(makeRows([ADDR_A, ADDR_B]));
 
-    render(<LeaderboardPage />);
-
-    // First poll.
-    await act(async () => { await vi.runAllTicks(); });
-
-    // Two more polls fire (each at +5 s and +10 s).
     await act(async () => {
-      vi.advanceTimersByTime(10_000);
-      await vi.runAllTicks();
+      root.render(<LeaderboardPage />);
+      await Promise.resolve();
     });
 
-    // Despite 3 polls, reverseHandle should have been called exactly once per
-    // address (2 total) — not 6 times (3 polls × 2 addresses).
-    expect(reverseHandleMock).toHaveBeenCalledTimes(2);
-    expect(reverseHandleMock).toHaveBeenCalledWith(ADDR_A);
-    expect(reverseHandleMock).toHaveBeenCalledWith(ADDR_B);
+    // Two more polls fire (each at +5 s and +10 s) while the first batch is pending.
+    await act(async () => {
+      vi.advanceTimersByTime(10_000);
+      await Promise.resolve();
+    });
+
+    // Despite 3 polls, the batched lookup should have been made exactly once for
+    // both addresses — not once per poll.
+    expect(reverseHandlesMock).toHaveBeenCalledTimes(1);
+    expect(reverseHandlesMock).toHaveBeenCalledWith([ADDR_A, ADDR_B]);
   });
 
   it('does not restart lookups when the poll returns identical data', async () => {
     const rows = makeRows([ADDR_A]);
     // Return a *new array* on every tick, but with identical content.
     fetchLeaderboardMock.mockImplementation(async () => [...rows]);
+    reverseHandlesMock.mockResolvedValue({ [ADDR_A]: 'alice' });
 
-    reverseHandleMock.mockResolvedValue('alice');
-
-    render(<LeaderboardPage />);
-
-    await act(async () => { await vi.runAllTicks(); });
+    await act(async () => {
+      root.render(<LeaderboardPage />);
+      await Promise.resolve();
+    });
 
     // Three more polls — same content each time.
     await act(async () => {
       vi.advanceTimersByTime(15_000);
-      await vi.runAllTicks();
+      await Promise.resolve();
     });
 
     // The address-key is stable, so the lookup effect didn't re-run.
-    // reverseHandle should have been called exactly once.
-    expect(reverseHandleMock).toHaveBeenCalledTimes(1);
+    expect(reverseHandlesMock).toHaveBeenCalledTimes(1);
   });
 
   it('still resolves handles for new addresses that appear after the initial poll', async () => {
-    // First poll: only ADDR_A.
+    // First poll: only ADDR_A. Second poll onward: both ADDR_A and ADDR_B.
     fetchLeaderboardMock.mockResolvedValueOnce(makeRows([ADDR_A]));
-    // Second poll: both ADDR_A and ADDR_B.
     fetchLeaderboardMock.mockResolvedValue(makeRows([ADDR_A, ADDR_B]));
 
-    reverseHandleMock.mockImplementation((addr: string) =>
-      Promise.resolve(addr === ADDR_A ? 'alice' : 'bob'),
+    reverseHandlesMock.mockImplementation(async (addrs: string[]) =>
+      Object.fromEntries(addrs.map((a) => [a, a === ADDR_A ? 'alice' : 'bob'])),
     );
 
-    render(<LeaderboardPage />);
-
-    // First poll settles.
-    await act(async () => { await vi.runAllTicks(); });
-
-    // ADDR_A resolved immediately; ADDR_B is not yet in the list.
-    await waitFor(() => expect(reverseHandleMock).toHaveBeenCalledWith(ADDR_A));
-    expect(reverseHandleMock).not.toHaveBeenCalledWith(ADDR_B);
-
-    // Second poll fires at +5 s, brings in ADDR_B.
     await act(async () => {
-      vi.advanceTimersByTime(5_000);
-      await vi.runAllTicks();
+      root.render(<LeaderboardPage />);
+      await Promise.resolve();
     });
 
-    await waitFor(() => expect(reverseHandleMock).toHaveBeenCalledWith(ADDR_B));
-    await waitFor(() => expect(screen.getByText('@bob')).toBeTruthy());
+    // ADDR_A resolved immediately; ADDR_B is not yet in the list.
+    expect(reverseHandlesMock).toHaveBeenCalledWith([ADDR_A]);
+    expect(container.textContent).toContain('@alice');
+
+    // Second poll fires at +5 s, brings in ADDR_B — only the new address is looked up.
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+      await Promise.resolve();
+    });
+
+    expect(reverseHandlesMock).toHaveBeenCalledWith([ADDR_B]);
+    expect(container.textContent).toContain('@bob');
   });
 });

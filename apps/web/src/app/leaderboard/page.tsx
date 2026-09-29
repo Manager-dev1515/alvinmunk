@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { fetchLeaderboard } from '@/lib/leaderboard';
 import { type LeaderboardEntry } from '@alvinmunk/shared';
 import { loadProfile } from '@/lib/profile';
-import { reverseHandle } from '@/lib/registry';
+import { reverseHandles } from '@/lib/registry';
 import { Crest } from '@/components/brand/crest';
 import { Frame } from '@/components/fx/frame';
 import { ShareRow } from '@/components/fx/share-row';
@@ -13,9 +13,6 @@ import { StateArt } from '@/components/ui/state-art';
 import { Sticker } from '@/components/ui/sticker';
 import { useTranslations } from '@/lib/i18n';
 import { cn, shortAddress } from '@/lib/utils';
-
-/** Max concurrent reverseHandle calls so we don't flood the RPC. */
-const HANDLE_CONCURRENCY = 5;
 
 export default function LeaderboardPage() {
   const t = useTranslations();
@@ -44,31 +41,21 @@ export default function LeaderboardPage() {
 
     if (missing.length === 0) return;
 
-    // Mark them all as in-flight immediately so concurrent effect runs skip them.
+    // Mark them all as in-flight immediately so a re-run of this effect (or the next
+    // poll tick, once addressKey settles) never starts the same lookup twice.
     for (const a of missing) pendingHandles.current.add(a);
 
-    let cancelled = false;
+    let alive = true;
+    // One batched reverse_many read (lib/registry.ts) instead of N single-address
+    // calls — this is what #319 already gives us for free.
+    reverseHandles(missing).then((map) => alive && setHandles((h) => ({ ...h, ...map })));
 
-    // Resolve in batches of HANDLE_CONCURRENCY, merging each result as it arrives.
-    const resolve = async () => {
-      for (let i = 0; i < missing.length; i += HANDLE_CONCURRENCY) {
-        if (cancelled) break;
-        const batch = missing.slice(i, i + HANDLE_CONCURRENCY);
-        const pairs = await Promise.all(
-          batch.map(async (a) => [a, await reverseHandle(a).catch(() => null)] as const),
-        );
-        if (!cancelled) {
-          setHandles((h) => ({ ...h, ...Object.fromEntries(pairs) }));
-        }
-      }
-    };
-
-    void resolve();
-
-    // We do NOT remove addresses from pendingHandles on cancel — if the
-    // component unmounts the lookup is abandoned, but on the next mount a
-    // fresh ref is created and lookups start from scratch, which is correct.
-    return () => { cancelled = true; };
+    // We do NOT remove addresses from pendingHandles on cleanup — if the component
+    // unmounts the lookup is abandoned, but a fresh mount gets a fresh ref and starts
+    // over, which is correct. What must never happen is a batch still in flight being
+    // silently discarded by the *next poll tick* re-running this effect — that's the
+    // #208 bug, and addressKey (below) is what stops that.
+    return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [addressKey]); // stable key: only re-runs when the actual set of addresses changes
 
@@ -76,27 +63,11 @@ export default function LeaderboardPage() {
     let alive = true;
     const tick = async () => {
       try {
-        const r = await fetchLeaderboard();
-        if (!alive) return;
-        // Only update rows when the ranking actually changed so we don't
-        // produce a new array reference (and thus don't re-trigger the
-        // handle-lookup effect) on a quiet poll.
-        setRows((prev) => {
-          if (
-            prev.length === r.length &&
-            prev.every(
-              (e, i) =>
-                e.address === r[i].address &&
-                e.score === r[i].score &&
-                e.rank === r[i].rank &&
-                e.flagged === r[i].flagged,
-            )
-          ) {
-            return prev; // same content — keep the existing reference
-          }
-          return r;
-        });
-        setStale(false);
+        // A new `rows` array reference on every tick is fine now — the handle-lookup
+        // effect above depends on `addressKey` (the stable, sorted set of addresses),
+        // not on `rows` itself, so a quiet poll no longer re-triggers or cancels it.
+        const r = await fetchLeaderboard({ throwOnError: true });
+        if (alive) { setRows(r); setStale(false); }
       } catch {
         if (alive) setStale(true);
       } finally {
@@ -116,17 +87,19 @@ export default function LeaderboardPage() {
         <span
           className={cn(
             'inline-flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-[0.15em]',
-            stale ? 'text-amber-400/90' : 'text-secondary/80',
+            stale && rows.length > 0 ? 'text-amber-400/90' : (stale ? 'text-destructive/80' : 'text-secondary/80'),
           )}
           title={stale ? t('leaderboard.syncTitle.stale') : t('leaderboard.syncTitle.live')}
         >
-          <span
-            className={cn(
-              'size-1.5 rounded-full',
-              stale ? 'bg-amber-400' : 'bg-secondary motion-safe:animate-glow-pulse',
-            )}
-          />
-          {stale ? t('leaderboard.syncDelayed') : t('leaderboard.live')}
+          {stale && rows.length === 0 ? null : (
+            <span
+              className={cn(
+                'size-1.5 rounded-full',
+                stale ? 'bg-amber-400' : 'bg-secondary motion-safe:animate-glow-pulse',
+              )}
+            />
+          )}
+          {stale && rows.length === 0 ? t('leaderboard.syncFailed') : (stale ? t('leaderboard.syncDelayed') : t('leaderboard.live'))}
         </span>
       </div>
       <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
@@ -144,12 +117,34 @@ export default function LeaderboardPage() {
             ))}
           </div>
         ) : rows.length === 0 ? (
-          <div className="flex flex-col items-center gap-4 p-10 text-center">
-            <StateArt kind="empty-leaderboard" size={300} className="motion-safe:animate-float" />
-            <p className="font-mono text-sm text-muted-foreground">
-              {t('leaderboard.empty')}
-            </p>
-          </div>
+          stale ? (
+            <div className="flex flex-col items-center gap-4 p-10 text-center">
+              <div className="space-y-1">
+                <p className="font-mono text-sm text-foreground">{t('leaderboard.syncFailed')}</p>
+                <p className="font-mono text-xs text-muted-foreground">{t('leaderboard.syncFailedBody')}</p>
+              </div>
+              <button
+                onClick={() => {
+                  setLoading(true);
+                  setStale(false);
+                  fetchLeaderboard({ throwOnError: true })
+                    .then(r => { setRows(r); setStale(false); })
+                    .catch(() => setStale(true))
+                    .finally(() => setLoading(false));
+                }}
+                className="mt-2 rounded bg-primary/10 px-4 py-2 font-mono text-xs text-primary hover:bg-primary/20"
+              >
+                {t('leaderboard.retry')}
+              </button>
+            </div>
+          ) : (
+            <div className="flex flex-col items-center gap-4 p-10 text-center">
+              <StateArt kind="empty-leaderboard" size={300} className="motion-safe:animate-float" />
+              <p className="font-mono text-sm text-muted-foreground">
+                {t('leaderboard.empty')}
+              </p>
+            </div>
+          )
         ) : (
           <ol className="divide-y divide-border/50">
             {rows.map((e) => {
