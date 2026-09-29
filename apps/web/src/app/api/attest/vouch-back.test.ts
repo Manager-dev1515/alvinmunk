@@ -13,7 +13,7 @@
  *    and that the scan starts from oldestLedger.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { Keypair, nativeToScVal, scValToNative, xdr } from '@stellar/stellar-sdk';
+import { Keypair, StrKey, nativeToScVal, scValToNative, xdr } from '@stellar/stellar-sdk';
 
 // ── RPC mock (hoisted so the module factory sees it) ─────────────────────────
 
@@ -42,7 +42,11 @@ import { decodeVouchClaimedEvent } from './route';
 
 // ── shared fixtures ───────────────────────────────────────────────────────────
 
-const ALICE  = 'G' + 'A'.repeat(55);
+// ALICE is used as the request `recipient`, which the 200-status tests carry all the way
+// to real signing (`Address(recipient).toScVal()`), so it must be a checksum-valid StrKey —
+// unlike BOB/CAROL/DAVE, which only ever appear as opaque `claimer` strings inside decoded
+// events and never pass through Address().
+const ALICE  = Keypair.random().publicKey();
 const BOB    = 'G' + 'B'.repeat(55);
 const CAROL  = 'G' + 'C'.repeat(55);
 const DAVE   = 'G' + 'D'.repeat(55);
@@ -176,11 +180,22 @@ describe('POST /api/attest — vouch_back evidence (issue #165)', () => {
   beforeEach(() => {
     vi.resetModules();
     process.env.ATTESTER_SECRET_KEY                     = ATTESTER_KP.secret();
-    process.env.NEXT_PUBLIC_QUEST_REGISTRY_CONTRACT_ID  = 'C' + 'Q'.repeat(55);
-    process.env.NEXT_PUBLIC_REPUTATION_CONTRACT_ID      = 'C' + 'R'.repeat(55);
+    // Real, checksum-valid contract StrKeys — a fake shape like 'C' + 'Q'.repeat(55)
+    // fails `new Contract(...)`/`Address(...).toScVal()` with "Invalid contract ID"
+    // once a request reaches real signing, so the 200-path tests below would never
+    // exercise the branch they claim to.
+    process.env.NEXT_PUBLIC_QUEST_REGISTRY_CONTRACT_ID  = StrKey.encodeContract(Buffer.alloc(32, 17));
+    process.env.NEXT_PUBLIC_REPUTATION_CONTRACT_ID      = StrKey.encodeContract(Buffer.alloc(32, 18));
     process.env.NEXT_PUBLIC_RPC_URL                     = 'https://soroban-testnet.stellar.org';
     process.env.NEXT_PUBLIC_HORIZON_URL                 = 'https://horizon-testnet.stellar.org';
     process.env.NEXT_PUBLIC_STELLAR_NETWORK             = 'testnet';
+    // Quest ↔ evidence binding (lib/attest.ts buildQuestEvidenceMap, issue #359): bind
+    // quest 1 (the id every test below uses) to vouch_back, and clear the other
+    // binding vars so no value leaks in from a previous test.
+    process.env.NEXT_PUBLIC_VOUCHBACK_QUEST_ID          = '1';
+    delete process.env.NEXT_PUBLIC_DEFAULT_QUEST_ID;
+    delete process.env.NEXT_PUBLIC_INVITE_QUEST_ID;
+    delete process.env.QUEST_GITHUB_ID;
     getHealthMock.mockReset();
     getEventsMock.mockReset();
     simulateMock.mockReset();
