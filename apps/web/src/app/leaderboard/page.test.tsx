@@ -187,7 +187,10 @@ describe('LeaderboardPage — poll / handle-lookup interaction (issue #208)', ()
         ),
     );
 
-    fetchLeaderboardMock.mockResolvedValue(makeRows([ADDR_A]));
+    // A NEW array reference on every call, like the real rankLeaderboard — this is
+    // what makes the old `[rows, handles]`-keyed effect re-run (and cancel the
+    // in-flight lookup) on every poll tick even though nothing changed.
+    fetchLeaderboardMock.mockImplementation(async () => makeRows([ADDR_A]));
 
     await act(async () => {
       root.render(<LeaderboardPage />);
@@ -224,7 +227,8 @@ describe('LeaderboardPage — poll / handle-lookup interaction (issue #208)', ()
         ),
     );
 
-    fetchLeaderboardMock.mockResolvedValue(makeRows([ADDR_A, ADDR_B]));
+    // A new array reference every call, like the real rankLeaderboard.
+    fetchLeaderboardMock.mockImplementation(async () => makeRows([ADDR_A, ADDR_B]));
 
     await act(async () => {
       root.render(<LeaderboardPage />);
