@@ -18,11 +18,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Keypair, StrKey, nativeToScVal } from '@stellar/stellar-sdk';
 
+/** A syntactically valid (properly checksummed) contract StrKey for env fixtures. */
+function fakeContractId(fill: number): string {
+  return StrKey.encodeContract(Buffer.alloc(32, fill));
+}
+
 // ─── shared test fixtures ────────────────────────────────────────────────────
 
-const G = 'G' + 'A'.repeat(55); // valid G-address shape
-const G2 = 'G' + 'B'.repeat(55);
-const C = 'C' + 'A'.repeat(55); // valid C-address (passkey wallet)
+// Real, checksum-valid addresses — a syntactically-shaped-but-fake StrKey (e.g. 'G' +
+// 'A'.repeat(55)) fails `Address(...).toScVal()` with "Unsupported address type" once a
+// request reaches real signing, so the happy-path / signing-failure tests below would
+// never exercise the branch they claim to.
+const G = Keypair.random().publicKey(); // valid G-address
+const G2 = Keypair.random().publicKey(); // a second, distinct valid G-address
+const C = fakeContractId(1); // valid C-address (passkey smart-wallet / contract)
 
 /** Fake 32-byte payload the mock contract returns. */
 const FAKE_PAYLOAD = Buffer.alloc(32, 0xab);
@@ -84,7 +93,7 @@ async function loadRoute() {
 
 function setBaseEnv() {
   process.env.ATTESTER_SECRET_KEY = ATTESTER_KP.secret();
-  process.env.NEXT_PUBLIC_QUEST_REGISTRY_CONTRACT_ID = 'CQUESTID' + 'A'.repeat(48);
+  process.env.NEXT_PUBLIC_QUEST_REGISTRY_CONTRACT_ID = fakeContractId(9);
   process.env.NEXT_PUBLIC_RPC_URL = 'https://soroban-testnet.stellar.org';
   process.env.NEXT_PUBLIC_HORIZON_URL = 'https://horizon-testnet.stellar.org';
   process.env.NEXT_PUBLIC_STELLAR_NETWORK = 'testnet';
