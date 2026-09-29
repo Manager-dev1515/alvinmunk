@@ -15,11 +15,17 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Keypair, StrKey, nativeToScVal, scValToNative, xdr } from '@stellar/stellar-sdk';
 
-// ── RPC mock (hoisted so the module factory sees it) ─────────────────────────
+// ── RPC mock (vi.hoisted, not a plain const — lib/stellar.ts (#346) now constructs a
+// `new rpc.Server(...)` at module scope, and this file's top-level `import ... from
+// './route'` below pulls that in during the import phase, before any later top-level
+// `const` would have run; a plain const here would be read from the mock factory's
+// closure while still in the TDZ) ───────────────────────────────────────────────────
 
-const getHealthMock    = vi.fn();
-const getEventsMock    = vi.fn();
-const simulateMock     = vi.fn();
+const { getHealthMock, getEventsMock, simulateMock } = vi.hoisted(() => ({
+  getHealthMock: vi.fn(),
+  getEventsMock: vi.fn(),
+  simulateMock: vi.fn(),
+}));
 
 vi.mock('@stellar/stellar-sdk', async (importOriginal) => {
   const real = await importOriginal<typeof import('@stellar/stellar-sdk')>();
