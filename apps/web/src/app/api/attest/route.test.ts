@@ -1,26 +1,22 @@
 // @vitest-environment node
 /**
- * Tests for the /api/attest route handler — issue #180.
+ * Tests for the /api/attest route handler.
  *
- * Every status-code branch is exercised:
- *   500  attester not configured
- *   413  body too large (content-length header / chunked oversize body)
- *   429  rate limit exceeded
- *   400  invalid JSON / bad questId or recipient
- *   422  bad evidence shape / failed verification
- *   502  signing failure
- *   200  happy path — signature is verified cryptographically
+ * Two suites:
+ *   - "status codes" (issue #180): every status-code branch of the handler itself —
+ *     config, body size, rate limit, input validation, evidence shape/verification,
+ *     signing, and the happy path (signature verified cryptographically).
+ *   - "quest ↔ evidence binding" (issue #359 regression coverage): the handler must
+ *     refuse to sign a quest id for any evidence type other than the one bound to it,
+ *     and must do so before verifying anything over the network.
  *
- * Strategy:
- *   - `hits` and `REPO_ALLOWLIST` live at module scope, so env vars are set
- *     BEFORE each import and vi.resetModules() is called to get a fresh module.
- *   - fetch is stubbed with vi.stubGlobal so no real HTTP calls are made.
- *   - rpc.Server is mocked so simulateTransaction returns a controlled payload.
- *   - The happy-path keypair is a real Keypair generated here; we assert the
- *     returned sig verifies over the mocked payload bytes.
+ * Both suites share one mock of `@stellar/stellar-sdk` that replaces `rpc.Server` with
+ * a stub exposing `simulateTransaction` / `getLatestLedger` / `getEvents` as plain
+ * `vi.fn()`s — real Keypair/StrKey/nativeToScVal/etc. pass through unmocked so the
+ * happy-path signature can be verified cryptographically.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { Keypair, nativeToScVal } from '@stellar/stellar-sdk';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Keypair, StrKey, nativeToScVal } from '@stellar/stellar-sdk';
 
 // ─── shared test fixtures ────────────────────────────────────────────────────
 
@@ -34,7 +30,7 @@ const FAKE_PAYLOAD = Buffer.alloc(32, 0xab);
 /** Real keypair used in the happy path so we can verify the signature. */
 const ATTESTER_KP = Keypair.random();
 
-// ─── RPC / Stellar mock ──────────────────────────────────────────────────────
+// ─── RPC / Stellar mock (shared by both suites) ─────────────────────────────
 
 const simulateMock = vi.fn();
 const getLatestLedgerMock = vi.fn();
@@ -56,7 +52,9 @@ vi.mock('@stellar/stellar-sdk', async (importOriginal) => {
   };
 });
 
-// ─── helpers ─────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+// Suite 1 — status codes (issue #180)
+// ══════════════════════════════════════════════════════════════════════════
 
 /** Build a minimal Next.js-compatible Request with a JSON body. */
 function makeRequest(
@@ -93,6 +91,14 @@ function setBaseEnv() {
   delete process.env.QUEST_GITHUB_REPOS;
   delete process.env.GITHUB_TOKEN;
   delete process.env.NEXT_PUBLIC_REPUTATION_CONTRACT_ID;
+  // Quest ↔ evidence binding (lib/attest.ts buildQuestEvidenceMap). Left unset so
+  // DEFAULT_QUEST_IDS applies: referral_tx→2, invite_converts→3, vouch_back→4;
+  // github_pr stays unmapped unless a test opts in via QUEST_GITHUB_ID below. Deleted
+  // (not just left alone) so a value set by one test can never leak into the next.
+  delete process.env.QUEST_GITHUB_ID;
+  delete process.env.NEXT_PUBLIC_DEFAULT_QUEST_ID;
+  delete process.env.NEXT_PUBLIC_INVITE_QUEST_ID;
+  delete process.env.NEXT_PUBLIC_VOUCHBACK_QUEST_ID;
 }
 
 /** Default simulateTransaction for the quest_payload call — returns FAKE_PAYLOAD. */
@@ -101,9 +107,7 @@ function setupPayloadSim() {
   simulateMock.mockResolvedValue({ result: { retval } });
 }
 
-// ─── tests ────────────────────────────────────────────────────────────────────
-
-describe('POST /api/attest', () => {
+describe('POST /api/attest — status codes (issue #180)', () => {
   beforeEach(() => {
     vi.resetModules();
     setBaseEnv();
@@ -124,7 +128,7 @@ describe('POST /api/attest', () => {
     const POST = await loadRoute();
     const res = await POST(makeRequest({ questId: 1, recipient: G }));
     expect(res.status).toBe(500);
-    const body = await res.json() as { error: string };
+    const body = (await res.json()) as { error: string };
     expect(body.error).toMatch(/not configured/i);
   });
 
@@ -190,7 +194,7 @@ describe('POST /api/attest', () => {
     });
     const res = await POST(req);
     expect(res.status).toBe(400);
-    const body = await res.json() as { error: string };
+    const body = (await res.json()) as { error: string };
     expect(body.error).toMatch(/json/i);
   });
 
@@ -230,121 +234,168 @@ describe('POST /api/attest', () => {
 
   it('422 when evidence type is unknown', async () => {
     const POST = await loadRoute();
-    const res = await POST(makeRequest({ questId: 1, recipient: G, evidence: { type: 'nope', ref: 'x' } }));
+    const res = await POST(
+      makeRequest({ questId: 1, recipient: G, evidence: { type: 'nope', ref: 'x' } }),
+    );
     expect(res.status).toBe(422);
   });
 
   it('422 when github_pr ref format is wrong', async () => {
     const POST = await loadRoute();
-    const res = await POST(makeRequest({
-      questId: 1, recipient: G,
-      evidence: { type: 'github_pr', ref: 'not-a-pr-ref' },
-    }));
+    const res = await POST(
+      makeRequest({
+        questId: 1,
+        recipient: G,
+        evidence: { type: 'github_pr', ref: 'not-a-pr-ref' },
+      }),
+    );
     expect(res.status).toBe(422);
   });
 
   it('422 when referral_tx ref is not a G-address', async () => {
     const POST = await loadRoute();
-    const res = await POST(makeRequest({
-      questId: 1, recipient: G,
-      evidence: { type: 'referral_tx', ref: 'NOTANADDRESS' },
-    }));
+    const res = await POST(
+      makeRequest({
+        questId: 2,
+        recipient: G,
+        evidence: { type: 'referral_tx', ref: 'NOTANADDRESS' },
+      }),
+    );
     expect(res.status).toBe(422);
   });
 
   it('422 when referral_tx is a self-referral', async () => {
     const POST = await loadRoute();
-    const res = await POST(makeRequest({
-      questId: 1, recipient: G,
-      evidence: { type: 'referral_tx', ref: G },
-    }));
+    const res = await POST(
+      makeRequest({
+        questId: 2,
+        recipient: G,
+        evidence: { type: 'referral_tx', ref: G },
+      }),
+    );
     expect(res.status).toBe(422);
   });
 
   // ── 422: evidence verification — github_pr ────────────────────────────────
+  // github_pr has no DEFAULT_QUEST_IDS entry (lib/attest.ts), so these bind it to
+  // quest 1 via QUEST_GITHUB_ID before loading the route — otherwise the quest ↔
+  // evidence binding check (added for issue #359) would reject at 422 before ever
+  // reaching verifyEvidence, and the assertions below would never be exercised.
 
   it('422 when github repo is not on the allowlist', async () => {
+    process.env.QUEST_GITHUB_ID = '1';
     process.env.QUEST_GITHUB_REPOS = 'allowed/repo';
     const POST = await loadRoute();
-    const res = await POST(makeRequest({
-      questId: 1, recipient: G,
-      evidence: { type: 'github_pr', ref: 'evil/repo#1' },
-    }));
+    const res = await POST(
+      makeRequest({
+        questId: 1,
+        recipient: G,
+        evidence: { type: 'github_pr', ref: 'evil/repo#1' },
+      }),
+    );
     expect(res.status).toBe(422);
-    const body = await res.json() as { error: string };
+    const body = (await res.json()) as { error: string };
     expect(body.error).toMatch(/not eligible/i);
   });
 
   it('422 when PR is not merged', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ merged: false }),
-    }));
+    process.env.QUEST_GITHUB_ID = '1';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ merged: false }),
+      }),
+    );
     const POST = await loadRoute();
-    const res = await POST(makeRequest({
-      questId: 1, recipient: G,
-      evidence: { type: 'github_pr', ref: 'owner/repo#42' },
-    }));
+    const res = await POST(
+      makeRequest({
+        questId: 1,
+        recipient: G,
+        evidence: { type: 'github_pr', ref: 'owner/repo#42' },
+      }),
+    );
     expect(res.status).toBe(422);
-    const body = await res.json() as { error: string };
+    const body = (await res.json()) as { error: string };
     expect(body.error).toMatch(/not merged/i);
   });
 
   it('422 when GitHub API returns non-200', async () => {
+    process.env.QUEST_GITHUB_ID = '1';
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 404 }));
     const POST = await loadRoute();
-    const res = await POST(makeRequest({
-      questId: 1, recipient: G,
-      evidence: { type: 'github_pr', ref: 'owner/repo#99' },
-    }));
+    const res = await POST(
+      makeRequest({
+        questId: 1,
+        recipient: G,
+        evidence: { type: 'github_pr', ref: 'owner/repo#99' },
+      }),
+    );
     expect(res.status).toBe(422);
-    const body = await res.json() as { error: string };
+    const body = (await res.json()) as { error: string };
     expect(body.error).toMatch(/github 404/i);
   });
 
   // ── 422: evidence verification — referral_tx ──────────────────────────────
+  // referral_tx defaults to quest 2 (DEFAULT_QUEST_IDS.referral_tx in lib/attest.ts),
+  // so these use questId 2 to clear the quest ↔ evidence binding check.
 
   it('422 when referred account is not found on Horizon (404)', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 404 }));
     const POST = await loadRoute();
-    const res = await POST(makeRequest({
-      questId: 1, recipient: G,
-      evidence: { type: 'referral_tx', ref: G2 },
-    }));
+    const res = await POST(
+      makeRequest({
+        questId: 2,
+        recipient: G,
+        evidence: { type: 'referral_tx', ref: G2 },
+      }),
+    );
     expect(res.status).toBe(422);
-    const body = await res.json() as { error: string };
+    const body = (await res.json()) as { error: string };
     expect(body.error).toMatch(/not found/i);
   });
 
   it('422 when referred account has no referral marker', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: {} }), // no "referral" key
-    }));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: {} }), // no "referral" key
+      }),
+    );
     const POST = await loadRoute();
-    const res = await POST(makeRequest({
-      questId: 1, recipient: G,
-      evidence: { type: 'referral_tx', ref: G2 },
-    }));
+    const res = await POST(
+      makeRequest({
+        questId: 2,
+        recipient: G,
+        evidence: { type: 'referral_tx', ref: G2 },
+      }),
+    );
     expect(res.status).toBe(422);
-    const body = await res.json() as { error: string };
+    const body = (await res.json()) as { error: string };
     expect(body.error).toMatch(/no "referral" data entry/i);
   });
 
   it('422 when referral marker points to a different referrer', async () => {
     const someoneElse = 'G' + 'C'.repeat(55);
     const encoded = Buffer.from(someoneElse, 'utf8').toString('base64');
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: { referral: encoded } }),
-    }));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: { referral: encoded } }),
+      }),
+    );
     const POST = await loadRoute();
-    const res = await POST(makeRequest({
-      questId: 1, recipient: G,
-      evidence: { type: 'referral_tx', ref: G2 },
-    }));
+    const res = await POST(
+      makeRequest({
+        questId: 2,
+        recipient: G,
+        evidence: { type: 'referral_tx', ref: G2 },
+      }),
+    );
     expect(res.status).toBe(422);
-    const body = await res.json() as { error: string };
+    const body = (await res.json()) as { error: string };
     expect(body.error).toMatch(/different referrer/i);
   });
 
@@ -352,74 +403,100 @@ describe('POST /api/attest', () => {
     // marker stores G2 (the ref / referred address) but recipient is G
     // stored === ev.ref triggers the self-referral branch
     const encoded = Buffer.from(G2, 'utf8').toString('base64');
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: { referral: encoded } }),
-    }));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: { referral: encoded } }),
+      }),
+    );
     const POST = await loadRoute();
-    const res = await POST(makeRequest({
-      questId: 1, recipient: G,
-      evidence: { type: 'referral_tx', ref: G2 },
-    }));
+    const res = await POST(
+      makeRequest({
+        questId: 2,
+        recipient: G,
+        evidence: { type: 'referral_tx', ref: G2 },
+      }),
+    );
     expect(res.status).toBe(422);
-    const body = await res.json() as { error: string };
+    const body = (await res.json()) as { error: string };
     expect(body.error).toMatch(/self-referral/i);
   });
 
   // ── 502: signing failure ──────────────────────────────────────────────────
 
   it('502 when simulateTransaction returns a simulation error', async () => {
+    process.env.QUEST_GITHUB_ID = '1';
     // Pass evidence verification (github_pr, merged PR).
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ merged: true }),
-    }));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ merged: true }),
+      }),
+    );
     // But payload simulation fails.
     simulateMock.mockResolvedValue({ error: 'contract panic' });
 
     const POST = await loadRoute();
-    const res = await POST(makeRequest({
-      questId: 1, recipient: G,
-      evidence: { type: 'github_pr', ref: 'owner/repo#1' },
-    }));
+    const res = await POST(
+      makeRequest({
+        questId: 1,
+        recipient: G,
+        evidence: { type: 'github_pr', ref: 'owner/repo#1' },
+      }),
+    );
     expect(res.status).toBe(502);
-    const body = await res.json() as { error: string };
+    const body = (await res.json()) as { error: string };
     expect(body.error).toMatch(/payload read failed/i);
   });
 
   it('502 when simulateTransaction throws', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ merged: true }),
-    }));
+    process.env.QUEST_GITHUB_ID = '1';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ merged: true }),
+      }),
+    );
     simulateMock.mockRejectedValue(new Error('rpc timeout'));
 
     const POST = await loadRoute();
-    const res = await POST(makeRequest({
-      questId: 1, recipient: G,
-      evidence: { type: 'github_pr', ref: 'owner/repo#1' },
-    }));
+    const res = await POST(
+      makeRequest({
+        questId: 1,
+        recipient: G,
+        evidence: { type: 'github_pr', ref: 'owner/repo#1' },
+      }),
+    );
     expect(res.status).toBe(502);
   });
 
   // ── 200: happy path — github_pr, signature verified ───────────────────────
 
   it('200 with valid github_pr evidence — returned sig verifies over the mocked payload', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ merged: true }),
-    }));
+    process.env.QUEST_GITHUB_ID = '5';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ merged: true }),
+      }),
+    );
     setupPayloadSim();
 
     const POST = await loadRoute();
-    const res = await POST(makeRequest({
-      questId: 5,
-      recipient: G,
-      evidence: { type: 'github_pr', ref: 'owner/repo#7' },
-    }));
+    const res = await POST(
+      makeRequest({
+        questId: 5,
+        recipient: G,
+        evidence: { type: 'github_pr', ref: 'owner/repo#7' },
+      }),
+    );
 
     expect(res.status).toBe(200);
-    const body = await res.json() as {
+    const body = (await res.json()) as {
       ok: boolean;
       attester: string;
       sig: string;
@@ -453,21 +530,26 @@ describe('POST /api/attest', () => {
 
   it('200 with valid referral_tx evidence and a C-address recipient', async () => {
     const encoded = Buffer.from(C, 'utf8').toString('base64'); // marker value = recipient
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: { referral: encoded } }),
-    }));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: { referral: encoded } }),
+      }),
+    );
     setupPayloadSim();
 
     const POST = await loadRoute();
-    const res = await POST(makeRequest({
-      questId: 2,
-      recipient: C,
-      evidence: { type: 'referral_tx', ref: G2 },
-    }));
+    const res = await POST(
+      makeRequest({
+        questId: 2,
+        recipient: C,
+        evidence: { type: 'referral_tx', ref: G2 },
+      }),
+    );
 
     expect(res.status).toBe(200);
-    const body = await res.json() as { ok: boolean; recipient: string };
+    const body = (await res.json()) as { ok: boolean; recipient: string };
     expect(body.ok).toBe(true);
     expect(body.recipient).toBe(C);
   });
@@ -479,10 +561,141 @@ describe('POST /api/attest', () => {
     // Fire requests from 501 distinct IPs to force the sweep branch.
     const promises: Promise<Response>[] = [];
     for (let i = 0; i < 501; i++) {
-      promises.push(POST(makeRequest({ questId: 1, recipient: G }, { ip: `10.0.${Math.floor(i / 256)}.${i % 256}` })));
+      promises.push(
+        POST(
+          makeRequest(
+            { questId: 1, recipient: G },
+            { ip: `10.0.${Math.floor(i / 256)}.${i % 256}` },
+          ),
+        ),
+      );
     }
     const responses = await Promise.all(promises);
     // None should be 429 (each IP has only 1 hit).
     for (const r of responses) expect(r.status).not.toBe(429);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// Suite 2 — quest ↔ evidence binding (issue #359 regression coverage)
+// ══════════════════════════════════════════════════════════════════════════
+// POST /api/attest must refuse to sign a quest id for any evidence type other than the one
+// bound to it, and must do so before verifying anything over the network.
+
+describe('POST /api/attest quest ↔ evidence binding', () => {
+  const RECIPIENT = Keypair.random().publicKey();
+  const REFERRED = Keypair.random().publicKey();
+  const QUEST_CONTRACT = StrKey.encodeContract(Buffer.alloc(32, 7));
+
+  type Post = (req: Request) => Promise<Response>;
+  let POST: Post;
+  let fetchSpy: ReturnType<typeof vi.fn>;
+
+  function attest(body: Record<string, unknown>): Promise<Response> {
+    return POST(
+      new Request('http://localhost/api/attest', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-forwarded-for': '203.0.113.9' },
+        body: JSON.stringify({ recipient: RECIPIENT, ...body }),
+      }),
+    );
+  }
+
+  beforeEach(async () => {
+    vi.resetModules();
+    simulateMock.mockReset();
+    getLatestLedgerMock.mockReset();
+    getEventsMock.mockReset();
+    vi.stubEnv('ATTESTER_SECRET_KEY', Keypair.random().secret());
+    vi.stubEnv('NEXT_PUBLIC_QUEST_REGISTRY_CONTRACT_ID', QUEST_CONTRACT);
+    vi.stubEnv('NEXT_PUBLIC_REPUTATION_CONTRACT_ID', QUEST_CONTRACT);
+    // The dashboard defaults: 2 = referral_tx, 3 = invite_converts, 4 = vouch_back; no GitHub quest.
+    vi.stubEnv('NEXT_PUBLIC_DEFAULT_QUEST_ID', '');
+    vi.stubEnv('NEXT_PUBLIC_INVITE_QUEST_ID', '');
+    vi.stubEnv('NEXT_PUBLIC_VOUCHBACK_QUEST_ID', '');
+    vi.stubEnv('QUEST_GITHUB_ID', '');
+    fetchSpy = vi.fn(async () => new Response('{}', { status: 404 }));
+    vi.stubGlobal('fetch', fetchSpy);
+    ({ POST } = (await import('./route')) as { POST: Post });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
+
+  function expectNoNetwork() {
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(simulateMock).not.toHaveBeenCalled();
+    expect(getLatestLedgerMock).not.toHaveBeenCalled();
+  }
+
+  it('rejects vouch_back evidence replayed against the 50 XP quests, before any network call', async () => {
+    for (const questId of [1, 3]) {
+      const res = await attest({ questId, evidence: { type: 'vouch_back', ref: '' } });
+      expect(res.status).toBe(422);
+      const body = (await res.json()) as { error: string; sig?: string };
+      expect(body.sig).toBeUndefined();
+    }
+    expectNoNetwork();
+  });
+
+  it('rejects a mismatched type with 422 and names the mismatch', async () => {
+    const res = await attest({ questId: 3, evidence: { type: 'referral_tx', ref: REFERRED } });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({ error: 'evidence type does not match this quest' });
+    expectNoNetwork();
+  });
+
+  it('rejects a quest id with no mapping, including github_pr while QUEST_GITHUB_ID is unset', async () => {
+    const unmapped = await attest({
+      questId: 99,
+      evidence: { type: 'referral_tx', ref: REFERRED },
+    });
+    expect(unmapped.status).toBe(422);
+    expect(await unmapped.json()).toEqual({ error: 'this quest cannot be attested' });
+    const github = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'o/r#1' } });
+    expect(github.status).toBe(422);
+    expectNoNetwork();
+  });
+
+  it('lets the bound type through to verification', async () => {
+    const res = await attest({ questId: 2, evidence: { type: 'referral_tx', ref: REFERRED } });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({ error: 'referred account not found on-chain' });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(String(fetchSpy.mock.calls[0][0])).toContain(`/accounts/${REFERRED}`);
+  });
+
+  it('signs the bound quest once its evidence verifies', async () => {
+    const marker = Buffer.from(RECIPIENT, 'utf8').toString('base64');
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ data: { referral: marker } }), { status: 200 }),
+    );
+    simulateMock.mockResolvedValueOnce({
+      result: { retval: nativeToScVal(Buffer.from('payload')) },
+    });
+    const res = await attest({ questId: 2, evidence: { type: 'referral_tx', ref: REFERRED } });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; questId: number; sig: string };
+    expect(body.ok).toBe(true);
+    expect(body.questId).toBe(2);
+    expect(body.sig).toBeTruthy();
+  });
+
+  it('binds a quest id configured in env, not its default', async () => {
+    vi.resetModules();
+    vi.stubEnv('QUEST_GITHUB_ID', '1');
+    vi.stubEnv('NEXT_PUBLIC_VOUCHBACK_QUEST_ID', '5');
+    ({ POST } = (await import('./route')) as { POST: Post });
+    // quest 4 is no longer the vouch_back quest
+    const res = await attest({ questId: 4, evidence: { type: 'vouch_back', ref: '' } });
+    expect(res.status).toBe(422);
+    expectNoNetwork();
+    // github_pr is now attestable on quest 1 (the GitHub API is reached)
+    const gh = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'o/r#1' } });
+    expect(gh.status).toBe(422);
+    expect(await gh.json()).toEqual({ error: 'github 404' });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 });
