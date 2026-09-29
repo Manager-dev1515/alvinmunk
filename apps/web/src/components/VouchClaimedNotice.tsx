@@ -10,6 +10,7 @@ import {
   requestPermission,
   getPermission,
   getActivePushSubscription,
+  getPushAvailabilityHint,
   syncPushSubscription,
 } from '@/lib/push';
 
@@ -85,6 +86,7 @@ export function VouchClaimedNotice() {
 
   // ─── 2. Push opt-in prompt ─────────────────────────────────────────────────
   const [showBanner, setShowBanner] = useState(false);
+  const [pushAvailabilityHint, setPushAvailabilityHint] = useState<string | null>(null);
   const [requesting, setRequesting] = useState(false);
 
   useEffect(() => {
@@ -94,6 +96,13 @@ export function VouchClaimedNotice() {
     //   • VAPID public key is configured (no key → push is disabled in this deploy)
     //   • We don't already have an active subscription
 
+    if (!process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY) return;
+    const availabilityHint = getPushAvailabilityHint();
+    if (availabilityHint) {
+      setPushAvailabilityHint(availabilityHint);
+      setShowBanner(true);
+      return;
+    }
     if (
       typeof window === 'undefined' ||
       !('serviceWorker' in navigator) ||
@@ -102,7 +111,6 @@ export function VouchClaimedNotice() {
     ) {
       return;
     }
-    if (!process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY) return;
     if (Notification.permission !== 'default') return;
 
     // Check if already subscribed (e.g. from a previous session).
@@ -143,15 +151,17 @@ export function VouchClaimedNotice() {
     >
       <Bell className="size-4 shrink-0 text-primary" aria-hidden />
       <p className="text-sm text-foreground">
-        Get notified when someone claims your vouch.
+        {pushAvailabilityHint ?? 'Get notified when someone claims your vouch.'}
       </p>
-      <button
-        onClick={handleEnable}
-        disabled={requesting}
-        className="ml-1 shrink-0 rounded-md bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground transition-opacity hover:opacity-80 disabled:opacity-50"
-      >
-        {requesting ? 'Enabling…' : 'Enable'}
-      </button>
+      {!pushAvailabilityHint && (
+        <button
+          onClick={handleEnable}
+          disabled={requesting}
+          className="ml-1 shrink-0 rounded-md bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground transition-opacity hover:opacity-80 disabled:opacity-50"
+        >
+          {requesting ? 'Enabling…' : 'Enable'}
+        </button>
+      )}
       <button
         onClick={() => setShowBanner(false)}
         aria-label="Dismiss push notification prompt"
